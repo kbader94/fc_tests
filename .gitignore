@@ -1,0 +1,15 @@
+..module-common.o.cmd
+uart_rx_trig_test.ko
+uart_rx_trig_test.mod
+uart_rx_trig_test.mod.c
+uart_rx_trig_test.mod.o
+uart_rx_trig_test.o
+modules.order
+Module.symvers
+.uart_rx_trig_test.o.cmd
+.uart_rx_trig_test.mod.o.cmd
+.uart_rx_trig_test.mod.cmd
+.uart_rx_trig_test.ko.cmd
+.modules.order.cmd
+.Module.symvers.cmd
+.module-common.o
