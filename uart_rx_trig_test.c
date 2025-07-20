@@ -372,18 +372,19 @@ static const struct file_operations tx_fifo_fops = {
 static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
                                   size_t count, loff_t *ppos)
 {
-	char tmp[128];
+	char tmp[64] = {0};
 	unsigned char rx_log[FIFO_SIZE_MAX];
 	struct tty_driver *driver;
 	struct tty_port *tport;
 	struct uart_port *port;
 	struct uart_state *state;
 	int line = 0;
-	unsigned char old_fcr, old_mcr, old_lcr, old_ier, iir;
+	unsigned char old_fcr, old_mcr, old_lcr, old_ier, iir, lsr = 0;
 	u32 old_dl;
 	int trig = -1;
 	int rx_count = 0;
 	unsigned long deadline;
+	int tmp_len = 0;
 
 	driver = tty_find_polling_driver(selected_dev, &line);
 	if (!driver)
@@ -412,10 +413,14 @@ static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
 
 	/* Enable FIFO & loopback */
 	port->serial_out(port, UART_FCR, UART_FCR_ENABLE_FIFO |
-                                UART_FCR_CLEAR_RCVR |
-                                UART_FCR_CLEAR_XMIT |
-                                UART_FCR_TRIGGER_1);
+	                                UART_FCR_CLEAR_RCVR |
+	                                UART_FCR_CLEAR_XMIT |
+	                                UART_FCR_TRIGGER_1);
 	port->serial_out(port, UART_MCR, old_mcr | UART_MCR_LOOP);
+
+	/* Drain RX FIFO */
+	while (port->serial_in(port, UART_LSR) & UART_LSR_DR)
+		port->serial_in(port, UART_RX);
 
 	/* Set baud rate 115200 */
 	port->serial_out(port, UART_LCR, UART_LCR_CONF_MODE_A);
@@ -429,17 +434,17 @@ static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
 	port->serial_out(port, UART_IER, UART_IER_THRI);
 
 	/* Fill THR */
-	for (int i = 0; i <= 255; i++)
-		port->serial_out(port, UART_TX, 0xFF);
+	for (int i = 0; i <= port->fifosize; i++)
+		port->serial_out(port, UART_TX, i);
 
 	/* Count how many bytes we rx until THR is empty */
 	deadline = jiffies + msecs_to_jiffies(1500);
 	while (time_before(jiffies, deadline)) {
-		while (port->serial_in(port, UART_LSR) & UART_LSR_DR) {
-			port->serial_in(port, UART_RX);
-			rx_count++;
+		lsr = port->serial_in(port, UART_LSR);
+		if (lsr & UART_LSR_DR) {
+			rx_log[rx_count++] = port->serial_in(port, UART_RX);
 		}
-		
+
 		iir = port->serial_in(port, UART_IIR);
 		if (!(iir & UART_IIR_NO_INT) && (iir & 0x0E) == UART_IIR_THRI) {
 			trig = rx_count;
@@ -466,13 +471,10 @@ static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
 
 	mutex_unlock(&tport->mutex);
 
-	if (trig < 0)
-		return simple_read_from_buffer(buf, count, ppos,
-				"TX trigger test failed\n", 24);
-	else {
-		int len = snprintf(tmp, sizeof(tmp), "%d\n", trig);
-		return simple_read_from_buffer(buf, count, ppos, tmp, len);
-	}
+	return (trig == 0)
+        ? simple_read_from_buffer(buf, count, ppos, "TX loopback failed or no data received\n", 42)
+        : scnprintf(tmp, sizeof(tmp), "%d\n", trig),
+          simple_read_from_buffer(buf, count, ppos, tmp, strlen(tmp));
 }
 
 static const struct file_operations tx_trig_fops = {
