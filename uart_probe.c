@@ -1,8 +1,8 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0
 /*
  * uart_probe.c - DebugFS interface for UART FIFO probing
  *
- * Copyright (C) 2024 Kyle Bader
+ * Copyright (C) 2025 Kyle L. Bader
  *
  * This module allows probing of UART FIFO sizes and levels
  * by utilizing internal loopback mode to physically test
@@ -66,9 +66,10 @@ static const struct file_operations select_dev_fops = {
 
 /* uart_probe/rx_trig_test
  * Probe the serial devices RX FIFO trigger level
- * by setting internal loopback and sending data to itself
+ * by setting internal loopback and sending data to itself,
+ * one byte at a time,
  * until the rx interrupt is triggered 
- * returns RX FIFO trigger level in number of bytes
+ * @returns RX FIFO trigger level in number of bytes
  */
 static ssize_t rx_trig_probe_read(struct file *file, char __user *buf,
                                   size_t count, loff_t *ppos)
@@ -119,22 +120,18 @@ static ssize_t rx_trig_probe_read(struct file *file, char __user *buf,
 	}
 
 	mutex_lock(&tport->mutex);
-	pr_info("uart_probe: locked tty_port mutex\n");
 
 	/* Store current port config */
 	old_lcr = port->serial_in(port, UART_LCR);
 	old_fcr = u8250p->fcr;
 	old_mcr = port->serial_in(port, UART_MCR);
-	pr_info("uart_probe: old LCR=0x%02x FCR=0x%02x MCR=0x%02x\n", old_lcr, old_fcr, old_mcr);
 
 	/* Enable and clear FIFO */
 	port->serial_out(port, UART_FCR,
 	                 old_fcr | UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT);
-	pr_info("uart_probe: enabled FIFO and cleared RX/TX\n");
 
 	/* Enable loopback */
 	port->serial_out(port, UART_MCR, old_mcr | UART_MCR_LOOP);
-	pr_info("uart_probe: loopback mode enabled\n");
 
 	/* Set baud to 115200 */
 	port->serial_out(port, UART_LCR, UART_LCR_CONF_MODE_A);
@@ -143,11 +140,9 @@ static ssize_t rx_trig_probe_read(struct file *file, char __user *buf,
 	port->serial_out(port, UART_DLL, 1);
 	port->serial_out(port, UART_DLM, 0);
 	port->serial_out(port, UART_LCR, UART_LCR_WLEN8);
-	pr_info("uart_probe: baud set to 115200 (DL=1), old DL=0x%04x\n", old_dl);
 
 	/* Enable RX interrupts */
 	port->serial_out(port, UART_IER, UART_IER_RDI);
-	pr_info("uart_probe: RX interrupt enabled\n");
 
 	/* Probe for trigger threshold */
 	for (trig = 1; trig < 256; trig++) {
@@ -156,23 +151,18 @@ static ssize_t rx_trig_probe_read(struct file *file, char __user *buf,
 		/* Wait for byte transmission */ 
 		udelay(100); /* 1 byte @ 115200 bps = ~87us */
 		iir = port->serial_in(port, UART_IIR);
-		pr_info("uart_probe: byte %d sent, IIR=0x%02x\n", trig, iir);
 
 		if (!(iir & 0x01) && ((iir & 0x0E) == UART_IIR_RDI)) {
-			pr_info("uart_probe: RX trigger interrupt detected at %d bytes\n", trig);
 			break;
 		}
 	}
 
 	/* Disable interrupts */
 	port->serial_out(port, UART_IER, 0x00);
-	pr_info("uart_probe: disabled IER\n");
 
 	/* Drain RX FIFO */
-	while (port->serial_in(port, UART_LSR) & UART_LSR_DR) {
-		unsigned char val = port->serial_in(port, UART_RX);
-		pr_info("uart_probe: drained RX byte: 0x%02x\n", val);
-	}
+	while (port->serial_in(port, UART_LSR) & UART_LSR_DR) 
+		port->serial_in(port, UART_RX);
 
 	/* Restore prior port config */
 	port->serial_out(port, UART_FCR, old_fcr);
@@ -181,10 +171,8 @@ static ssize_t rx_trig_probe_read(struct file *file, char __user *buf,
 	port->serial_out(port, UART_DLL, old_dl & 0xff);
 	port->serial_out(port, UART_DLM, old_dl >> 8);
 	port->serial_out(port, UART_LCR, old_lcr);
-	pr_info("uart_probe: restored original UART registers\n");
 
 	mutex_unlock(&tport->mutex);
-	pr_info("uart_probe: unlocked tty_port mutex\n");
 
 	if (trig >= 256) {
 		pr_err("uart_probe: RX trigger test failed — no interrupt detected\n");
@@ -201,48 +189,72 @@ static const struct file_operations rx_trig_fops = {
 	.llseek = default_llseek,
 };
 
-/* uart_probe/rx_fifo_size - Measure the RX FIFO size by overrun detection */
+/* uart_probe/rx_fifo_size
+ * Probe the RX FIFO size by setting internal loopback,
+ * transmitting data to itself, one byte at a time
+ * and detecting rx overrun
+ * @returns the size of th RX FIFO in number of bytes
+ */
 static ssize_t rx_fifo_size_read(struct file *file, char __user *buf,
                                  size_t count, loff_t *ppos)
 {
-    char tmp[64];
-    struct tty_driver *driver;
-    struct tty_port *tport;
-    struct uart_state *state;
-    struct uart_port *port;
-    int line = 0, count_tx;
-    unsigned char old_fcr, old_mcr, old_lcr, lsr;
-    u32 old_dl;
-    int rx_fifo_size = 0;
+	char tmp[128];
+	struct tty_driver *driver;
+	struct tty_port *tport;
+	struct uart_port *port;
+	struct uart_state *state;
+	struct uart_8250_port *u8250p;
+	unsigned char old_fcr, old_mcr, old_lcr, lsr;
+	u32 old_dl;
+    int line, count_tx, rx_fifo_size = 0;
 
-    driver = tty_find_polling_driver(selected_dev, &line);
-    if (!driver)
-        return -ENODEV;
+    pr_info("uart_probe: starting RX size probe\n");
 
-    tport = driver->ports[line];
-    if (!tport)
-        return -ENODEV;
+	driver = tty_find_polling_driver(selected_dev, &line);
+	if (!driver) {
+		pr_err("uart_probe: tty_find_polling_driver failed\n");
+		return -ENODEV;
+	}
 
-    state = container_of(tport, struct uart_state, port);
-    port = state->uart_port;
-    if (!port || !port->serial_in || !port->serial_out)
-        return -ENODEV;
+	tport = driver->ports[line];
+	if (!tport) {
+		pr_err("uart_probe: no tty_port found for line %d\n", line);
+		return -ENODEV;
+	}
 
-    if (tty_port_initialized(tport) && tty_port_users(tport) > 0)
-        return -EBUSY;
+	state = container_of(tport, struct uart_state, port);
+	port = state->uart_port;
+
+	if (!port || !port->serial_in || !port->serial_out) {
+		pr_err("uart_probe: invalid port or missing ops\n");
+		return -ENODEV;
+	}
+
+	u8250p = up_to_u8250p(port);
+	if (!u8250p) {
+		pr_err("uart_probe: Not an 8250-based UART\n");
+		return -ENODEV;
+	}
+
+	if (tty_port_initialized(tport) && tty_port_users(tport) > 0) {
+		pr_err("uart_probe: TTY device %s is busy or opened by userspace\n", selected_dev);
+		return -EBUSY;
+	}
 
     mutex_lock(&tport->mutex);
 
+	/* Store current port config */
     old_lcr = port->serial_in(port, UART_LCR);
-    port->serial_out(port, UART_LCR, 0x00);
-    old_fcr = port->serial_in(port, UART_FCR);
+    old_fcr = u8250p->fcr;
     old_mcr = port->serial_in(port, UART_MCR);
 
+	/* Enable FIFO and loopback */
     port->serial_out(port, UART_FCR, UART_FCR_ENABLE_FIFO |
                                     UART_FCR_CLEAR_RCVR |
                                     UART_FCR_CLEAR_XMIT);
     port->serial_out(port, UART_MCR, old_mcr | UART_MCR_LOOP);
 
+	/* Set baud 115200 */
     port->serial_out(port, UART_LCR, UART_LCR_CONF_MODE_A);
     old_dl = port->serial_in(port, UART_DLL) |
              (port->serial_in(port, UART_DLM) << 8);
@@ -250,6 +262,7 @@ static ssize_t rx_fifo_size_read(struct file *file, char __user *buf,
     port->serial_out(port, UART_DLM, 0);
     port->serial_out(port, UART_LCR, UART_LCR_WLEN8);
 
+	/* Transmit one byte at a time and check for overrun */
     for (count_tx = 0; count_tx < FIFO_SIZE_MAX; count_tx++) {
         port->serial_out(port, UART_TX, 0xff);
         mdelay(1);
@@ -261,13 +274,13 @@ static ssize_t rx_fifo_size_read(struct file *file, char __user *buf,
         }
     }
 
+	/* Restore initial port config */
     port->serial_out(port, UART_FCR, old_fcr);
     port->serial_out(port, UART_MCR, old_mcr);
     port->serial_out(port, UART_LCR, UART_LCR_CONF_MODE_A);
     port->serial_out(port, UART_DLL, old_dl & 0xff);
     port->serial_out(port, UART_DLM, old_dl >> 8);
     port->serial_out(port, UART_LCR, old_lcr);
-
     mutex_unlock(&tport->mutex);
 
     int len = (rx_fifo_size == 0)
@@ -281,55 +294,81 @@ static const struct file_operations rx_fifo_fops = {
     .llseek = default_llseek,
 };
 
+/* uart_probe/tx_fifo_size 
+ * Probe the TX FIFO size by overrunning the THR
+ * enabling loopback, and counting how many bytes
+ * we received. This should match port->fifosize.
+ * @returns TX FIFO size in number of bytes
+ */
 static ssize_t tx_fifo_size_read(struct file *file, char __user *buf,
                                  size_t count, loff_t *ppos)
 {
-    char tmp[64];
-    struct tty_driver *driver;
-    struct tty_port *tport;
-    struct uart_state *state;
-    struct uart_port *port;
-    unsigned char old_fcr, old_mcr, old_lcr, lsr;
-    u32 old_dl;
-    int tx_count = 0, rx_count = 0;
+    char tmp[128];
+	struct tty_driver *driver;
+	struct tty_port *tport;
+	struct uart_port *port;
+	struct uart_state *state;
+	struct uart_8250_port *u8250p;
     unsigned long deadline;
-    int line = 0, i;
+    int line, i , rx_count, tx_count = 0;
+	unsigned char old_fcr, old_mcr, old_lcr, lsr;
+	u32 old_dl;
 
-    driver = tty_find_polling_driver(selected_dev, &line);
-    if (!driver)
-        return -ENODEV;
+    pr_info("uart_probe: starting TX size probe\n");
 
-    tport = driver->ports[line];
-    if (!tport)
-        return -ENODEV;
+	driver = tty_find_polling_driver(selected_dev, &line);
+	if (!driver) {
+		pr_err("uart_probe: tty_find_polling_driver failed\n");
+		return -ENODEV;
+	}
 
-    state = container_of(tport, struct uart_state, port);
-    port = state->uart_port;
-    if (!port || !port->serial_in || !port->serial_out)
-        return -ENODEV;
+	tport = driver->ports[line];
+	if (!tport) {
+		pr_err("uart_probe: no tty_port found for line %d\n", line);
+		return -ENODEV;
+	}
 
-    if (tty_port_initialized(tport) && tty_port_users(tport) > 0)
-        return -EBUSY;
+	state = container_of(tport, struct uart_state, port);
+	port = state->uart_port;
+
+	if (!port || !port->serial_in || !port->serial_out) {
+		pr_err("uart_probe: invalid port or missing ops\n");
+		return -ENODEV;
+	}
+
+	u8250p = up_to_u8250p(port);
+	if (!u8250p) {
+		pr_err("uart_probe: Not an 8250-based UART\n");
+		return -ENODEV;
+	}
+
+	if (tty_port_initialized(tport) && tty_port_users(tport) > 0) {
+		pr_err("uart_probe: TTY device %s is busy or opened by userspace\n", selected_dev);
+		return -EBUSY;
+	}
 
     mutex_lock(&tport->mutex);
 
+	/* Store initial port config */
     old_lcr = port->serial_in(port, UART_LCR);
-    port->serial_out(port, UART_LCR, 0x00);
-    old_fcr = port->serial_in(port, UART_FCR);
+    old_fcr = u8250p->fcr;
     old_mcr = port->serial_in(port, UART_MCR);
 
+	/* Enable FIFO and Loopback */
     port->serial_out(port, UART_FCR, UART_FCR_ENABLE_FIFO |
                                     UART_FCR_CLEAR_RCVR |
                                     UART_FCR_CLEAR_XMIT);
     port->serial_out(port, UART_MCR, old_mcr | UART_MCR_LOOP);
 
+	/* Set baud 115200 */
     port->serial_out(port, UART_LCR, UART_LCR_CONF_MODE_A);
     old_dl = port->serial_in(port, UART_DLL) |
              (port->serial_in(port, UART_DLM) << 8);
     port->serial_out(port, UART_DLL, 1);
     port->serial_out(port, UART_DLM, 0);
     port->serial_out(port, UART_LCR, UART_LCR_WLEN8);
-
+	
+	/* Fill TX FIFO */
     for (i = 0; i < FIFO_SIZE_MAX; i++) {
         port->serial_out(port, UART_TX, 0xFF);
         tx_count++;
@@ -337,6 +376,7 @@ static ssize_t tx_fifo_size_read(struct file *file, char __user *buf,
 
 	mdelay(50);
 
+	/* Count how many bytes we received */
     deadline = jiffies + msecs_to_jiffies(500);
     while (time_before(jiffies, deadline) && rx_count < tx_count) {
         lsr = port->serial_in(port, UART_LSR);
@@ -349,6 +389,7 @@ static ssize_t tx_fifo_size_read(struct file *file, char __user *buf,
         }
     }
 
+	/* Restore port config */
     port->serial_out(port, UART_FCR, old_fcr);
     port->serial_out(port, UART_MCR, old_mcr);
     port->serial_out(port, UART_LCR, UART_LCR_CONF_MODE_A);
@@ -358,10 +399,14 @@ static ssize_t tx_fifo_size_read(struct file *file, char __user *buf,
 
     mutex_unlock(&tport->mutex);
 
-    return (rx_count == 0)
-        ? simple_read_from_buffer(buf, count, ppos, "TX loopback failed or no data received\n", 42)
-        : scnprintf(tmp, sizeof(tmp), "%d\n", rx_count),
-          simple_read_from_buffer(buf, count, ppos, tmp, strlen(tmp));
+	if (rx_count == 0)
+		return simple_read_from_buffer(buf, count, ppos, 
+					"TX loopback failed or no data received\n", 42);
+	else {
+		int strlen = scnprintf(tmp, sizeof(tmp), "%d\n", rx_count);
+		return simple_read_from_buffer(buf, count, ppos, tmp, strlen);
+	}
+   
 }
 
 static const struct file_operations tx_fifo_fops = {
@@ -369,38 +414,61 @@ static const struct file_operations tx_fifo_fops = {
     .llseek = default_llseek,
 };
 
+/* uart_probe/tx_trig_level
+ * Probe the trigger level of the TX FIFO
+ * by enabling loopback, filling the TX FIFO, 
+ * and counting how many bytes until THRI interrupt is set
+ * NOTE: we explicitly cap TX size to port->fifosize
+ * otherwise serial_out will drop & transmit
+ * randomly while it's full.
+ * @returns TX FIFO trigger level in number of bytes
+ */
 static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
                                   size_t count, loff_t *ppos)
 {
-	char tmp[64] = {0};
-	unsigned char rx_log[FIFO_SIZE_MAX];
+    char tmp[128];
 	struct tty_driver *driver;
 	struct tty_port *tport;
 	struct uart_port *port;
 	struct uart_state *state;
-	int line = 0;
-	unsigned char old_fcr, old_mcr, old_lcr, old_ier, iir, lsr = 0;
+	struct uart_8250_port *u8250p;
+    unsigned long deadline;
+    int line, trig, rx_count = 0;
+	unsigned char old_fcr, old_mcr, old_lcr, old_ier, lsr, iir;
 	u32 old_dl;
-	int trig = -1;
-	int rx_count = 0;
-	unsigned long deadline;
-	int tmp_len = 0;
+
+    pr_info("uart_probe: starting TX size probe\n");
 
 	driver = tty_find_polling_driver(selected_dev, &line);
-	if (!driver)
+	if (!driver) {
+		pr_err("uart_probe: tty_find_polling_driver failed\n");
 		return -ENODEV;
+	}
 
 	tport = driver->ports[line];
-	if (!tport)
+	if (!tport) {
+		pr_err("uart_probe: no tty_port found for line %d\n", line);
 		return -ENODEV;
+	}
 
 	state = container_of(tport, struct uart_state, port);
 	port = state->uart_port;
-	if (!port || !port->serial_in || !port->serial_out)
-		return -ENODEV;
 
-	if (tty_port_initialized(tport) && tty_port_users(tport) > 0)
+	if (!port || !port->serial_in || !port->serial_out) {
+		pr_err("uart_probe: invalid port or missing ops\n");
+		return -ENODEV;
+	}
+
+	u8250p = up_to_u8250p(port);
+	if (!u8250p) {
+		pr_err("uart_probe: Not an 8250-based UART\n");
+		return -ENODEV;
+	}
+
+	if (tty_port_initialized(tport) && tty_port_users(tport) > 0) {
+		pr_err("uart_probe: TTY device %s is busy or opened by userspace\n", selected_dev);
 		return -EBUSY;
+	}
 
 	mutex_lock(&tport->mutex);
 
@@ -425,7 +493,7 @@ static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
 	/* Set baud rate 115200 */
 	port->serial_out(port, UART_LCR, UART_LCR_CONF_MODE_A);
 	old_dl = port->serial_in(port, UART_DLL) |
-	         (port->serial_in(port, UART_DLM) << 8);
+	        	(port->serial_in(port, UART_DLM) << 8);
 	port->serial_out(port, UART_DLL, 1);
 	port->serial_out(port, UART_DLM, 0);
 	port->serial_out(port, UART_LCR, UART_LCR_WLEN8);
@@ -433,16 +501,17 @@ static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
 	/* Enable Transmission Hold Register Empty Interrupt */
 	port->serial_out(port, UART_IER, UART_IER_THRI);
 
-	/* Fill THR */
+	/* Fill THR, but don't overfill it!  */
 	for (int i = 0; i <= port->fifosize; i++)
-		port->serial_out(port, UART_TX, i);
+		port->serial_out(port, UART_TX, 0xFF);
 
 	/* Count how many bytes we rx until THR is empty */
 	deadline = jiffies + msecs_to_jiffies(1500);
 	while (time_before(jiffies, deadline)) {
 		lsr = port->serial_in(port, UART_LSR);
 		if (lsr & UART_LSR_DR) {
-			rx_log[rx_count++] = port->serial_in(port, UART_RX);
+			port->serial_in(port, UART_RX);
+			rx_count++;
 		}
 
 		iir = port->serial_in(port, UART_IIR);
@@ -457,7 +526,7 @@ static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
 	/* Restore IER */
 	port->serial_out(port, UART_IER, old_ier);
 
-	/* Drain RX FIFO */
+	/* Drain RX FIFO just in case */
 	while (port->serial_in(port, UART_LSR) & UART_LSR_DR)
 		port->serial_in(port, UART_RX);
 
@@ -471,10 +540,15 @@ static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
 
 	mutex_unlock(&tport->mutex);
 
-	return (trig == 0)
-        ? simple_read_from_buffer(buf, count, ppos, "TX loopback failed or no data received\n", 42)
-        : scnprintf(tmp, sizeof(tmp), "%d\n", trig),
-          simple_read_from_buffer(buf, count, ppos, tmp, strlen(tmp));
+
+	if (trig == 0)
+		return simple_read_from_buffer(buf, count, ppos, 
+					"TX loopback failed or no data received\n", 42);
+	else {
+		int len = scnprintf(tmp, sizeof(tmp), "%d\n", trig);
+		return simple_read_from_buffer(buf, count, ppos, tmp, len);
+	}
+
 }
 
 static const struct file_operations tx_trig_fops = {
