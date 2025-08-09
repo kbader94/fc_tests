@@ -61,7 +61,7 @@ static ssize_t select_dev_read(struct file *file, char __user *buf,
 
 static const struct file_operations select_dev_fops = {
     .write = select_dev_write,
-	.read = select_dev_read,
+    .read = select_dev_read,
 };
 
 /* uart_probe/rx_trig_test
@@ -588,4 +588,4 @@ module_exit(uart_probe_debugfs_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Kyle L. Bader");
-MODULE_DESCRIPTION("DebugFS interface for probing UART config");
+MODULE_DESCRIPTION("DebugFS interface for probing UART FIFO config");
