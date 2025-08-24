@@ -33,19 +33,28 @@ RTT of a single byte serial transmission in microseconds
 
 ***
 
-## UART Probe 
+## UART Probe Script 
 
 A Kernel module which provides debugfs interfaces for testing serial devices for the FIFO size and trigger levels. Currently only works with 16550 compatible devices(eg.  16650, 16750, 16850, etc.). Uses internal loopback. 
 
 ### Usage
-
-#### Probe all serial devices
+ Probe all serial devices
 
 ~~~
 ./uart_probe.sh
 ~~~
 
-#### Probe specific serial device
+##### Arguments
+| Arg | Description | Required |
+|:---: |---         | --- |
+|-d, --device | Serial device to test  <br> Leave blank to test all devices <br>     eg: --device /dev/ttyS0 | Required |
+| -r, --rx-trigger | Comma seperated list of FIFO Rx trigger levels to test. <br> If blank, only test the currently set trigger level <br> eg: --rx_trigger 1,4,8,14 | Optional |
+|-t, --tx-trigger | Comma seperated list of FIFO Tx trigger levels to test. <br> If blank, only test the currently set trigger level <br> eg: --rx_trigger 1,4,8,14 | Optional |
+
+
+***
+
+## FIFO Control DebugFS
 
 Ensure debugfs is enabled  
   

@@ -6,3 +6,4 @@
 *.o
 *.symvers
 *.order
+rtt_test

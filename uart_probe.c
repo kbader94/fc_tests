@@ -86,6 +86,9 @@ static ssize_t rx_trig_probe_read(struct file *file, char __user *buf,
 	unsigned char old_fcr, old_mcr, old_lcr, iir;
 	u32 old_dl;
 
+	if (*ppos)
+    	return 0;   /* EOF */
+
 	pr_info("uart_probe: starting RX trigger probe\n");
 
 	driver = tty_find_polling_driver(selected_dev, &line);
@@ -141,6 +144,25 @@ static ssize_t rx_trig_probe_read(struct file *file, char __user *buf,
 	port->serial_out(port, UART_DLM, 0);
 	port->serial_out(port, UART_LCR, UART_LCR_WLEN8);
 
+	u8 save_lcr = port->serial_in(port, UART_LCR);
+	port->serial_out(port, UART_LCR, 0xBF);                 /* conf mode B */
+	u8 efr = port->serial_in(port, UART_EFR);               /* bit4 = ECB */
+	u8 acr = port->serial_in(port, UART_ACR);               /* bit5 = TLENB (950 table) */
+	port->serial_out(port, UART_LCR, save_lcr);
+
+	pr_info("%s: EFR=%02x (ECB=%d) ACR=%02x (TLENB=%d) type=%d caps=%lx\n",
+			selected_dev, efr, !!(efr & UART_EFR_ECB),
+			acr, !!(acr & UART_ACR_TLENB),
+			port->type, up_to_u8250p(port)->capabilities);
+
+	
+	pr_info("%s: ACR bits: b7=%d b6=%d b5=%d b4=%d b3=%d b2=%d b1=%d b0=%d\n",
+		selected_dev,
+		(acr >> 7) & 1, (acr >> 6) & 1,
+		(acr >> 5) & 1, (acr >> 4) & 1,
+		(acr >> 3) & 1, (acr >> 2) & 1,
+		(acr >> 1) & 1, (acr >> 0) & 1);
+
 	/* Enable RX interrupts */
 	port->serial_out(port, UART_IER, UART_IER_RDI);
 
@@ -152,7 +174,10 @@ static ssize_t rx_trig_probe_read(struct file *file, char __user *buf,
 		udelay(100); /* 1 byte @ 115200 bps = ~87us */
 		iir = port->serial_in(port, UART_IIR);
 
-		if (!(iir & 0x01) && ((iir & 0x0E) == UART_IIR_RDI)) {
+		u8 iir_id = iir & UART_IIR_ID;
+
+		if (!(iir & UART_IIR_NO_INT)) {
+			if ((iir_id == UART_IIR_RDI) && (iir_id != UART_IIR_RX_TIMEOUT)) 
 			break;
 		}
 	}
@@ -208,6 +233,9 @@ static ssize_t rx_fifo_size_read(struct file *file, char __user *buf,
 	u32 old_dl;
     int line, count_tx, rx_fifo_size = 0;
 
+	if (*ppos)
+    	return 0;   /* EOF */
+
     pr_info("uart_probe: starting RX size probe\n");
 
 	driver = tty_find_polling_driver(selected_dev, &line);
@@ -251,7 +279,7 @@ static ssize_t rx_fifo_size_read(struct file *file, char __user *buf,
 	/* Enable FIFO and loopback */
     port->serial_out(port, UART_FCR, UART_FCR_ENABLE_FIFO |
                                     UART_FCR_CLEAR_RCVR |
-                                    UART_FCR_CLEAR_XMIT);
+                                    UART_FCR_CLEAR_XMIT | old_fcr);
     port->serial_out(port, UART_MCR, old_mcr | UART_MCR_LOOP);
 
 	/* Set baud 115200 */
@@ -313,6 +341,9 @@ static ssize_t tx_fifo_size_read(struct file *file, char __user *buf,
     int line, i , rx_count, tx_count = 0;
 	unsigned char old_fcr, old_mcr, old_lcr, lsr;
 	u32 old_dl;
+
+	if (*ppos)
+    	return 0;   /* EOF */
 
     pr_info("uart_probe: starting TX size probe\n");
 
@@ -433,9 +464,12 @@ static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
 	struct uart_state *state;
 	struct uart_8250_port *u8250p;
     unsigned long deadline;
-    int line, trig, rx_count = 0;
+    int line, trig, rx_count = 0, rx_fifo_size = 0;
 	unsigned char old_fcr, old_mcr, old_lcr, old_ier, lsr, iir;
 	u32 old_dl;
+
+	if (*ppos)
+    	return 0;   /* EOF */
 
     pr_info("uart_probe: starting TX size probe\n");
 
@@ -474,16 +508,14 @@ static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
 
 	/* Store initial port config */
 	old_lcr = port->serial_in(port, UART_LCR);
-	port->serial_out(port, UART_LCR, 0x00);
-	old_fcr = port->serial_in(port, UART_FCR);
+    old_fcr = u8250p->fcr;
 	old_mcr = port->serial_in(port, UART_MCR);
 	old_ier = port->serial_in(port, UART_IER);
 
-	/* Enable FIFO & loopback */
+	/* Enable FIFO and loopback */
 	port->serial_out(port, UART_FCR, UART_FCR_ENABLE_FIFO |
 	                                UART_FCR_CLEAR_RCVR |
-	                                UART_FCR_CLEAR_XMIT |
-	                                UART_FCR_TRIGGER_1);
+                                    UART_FCR_CLEAR_XMIT | old_fcr);
 	port->serial_out(port, UART_MCR, old_mcr | UART_MCR_LOOP);
 
 	/* Drain RX FIFO */
@@ -502,7 +534,7 @@ static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
 	port->serial_out(port, UART_IER, UART_IER_THRI);
 
 	/* Fill THR, but don't overfill it!  */
-	for (int i = 0; i <= port->fifosize; i++)
+	for (int i = 0; i <= 253; i++)
 		port->serial_out(port, UART_TX, 0xFF);
 
 	/* Count how many bytes we rx until THR is empty */
@@ -516,11 +548,11 @@ static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
 
 		iir = port->serial_in(port, UART_IIR);
 		if (!(iir & UART_IIR_NO_INT) && (iir & 0x0E) == UART_IIR_THRI) {
-			trig = rx_count;
+			trig = 254 - rx_count;
 			break;
 		}
 
-		cpu_relax();
+		ndelay(10);
 	}
 
 	/* Restore IER */
@@ -533,7 +565,6 @@ static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
 	/* Restore registers */
 	port->serial_out(port, UART_FCR, old_fcr);
 	port->serial_out(port, UART_MCR, old_mcr);
-	port->serial_out(port, UART_LCR, UART_LCR_CONF_MODE_A);
 	port->serial_out(port, UART_DLL, old_dl & 0xff);
 	port->serial_out(port, UART_DLM, old_dl >> 8);
 	port->serial_out(port, UART_LCR, old_lcr);
