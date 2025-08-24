@@ -64,6 +64,70 @@ static const struct file_operations select_dev_fops = {
     .read = select_dev_read,
 };
 
+static int measure_tx_fifo_size(struct tty_port *tport,
+                                struct uart_port *port,
+                                struct uart_8250_port *u8250p)
+{
+    unsigned char old_fcr, old_mcr, old_lcr, lsr;
+    u32 old_dl;
+    int i, tx_count = 0, rx_count = 0;
+    unsigned long deadline;
+
+    /* Store initial port config */
+    old_lcr = port->serial_in(port, UART_LCR);
+    old_fcr = u8250p->fcr;
+    old_mcr = port->serial_in(port, UART_MCR);
+
+    /* Enable FIFO and loopback */
+    port->serial_out(port, UART_FCR, UART_FCR_ENABLE_FIFO |
+                                    UART_FCR_CLEAR_RCVR |
+                                    UART_FCR_CLEAR_XMIT);
+    port->serial_out(port, UART_MCR, old_mcr | UART_MCR_LOOP);
+
+    /* Drain RX */
+    while (port->serial_in(port, UART_LSR) & UART_LSR_DR)
+        (void)port->serial_in(port, UART_RX);
+
+    /* Set baud 115200 (DL=1), 8N1 */
+    port->serial_out(port, UART_LCR, UART_LCR_CONF_MODE_A);
+    old_dl = port->serial_in(port, UART_DLL) |
+             (port->serial_in(port, UART_DLM) << 8);
+    port->serial_out(port, UART_DLL, 1);
+    port->serial_out(port, UART_DLM, 0);
+    port->serial_out(port, UART_LCR, UART_LCR_WLEN8);
+
+    /* Fill TX path with a bounded count */
+    for (i = 0; i < FIFO_SIZE_MAX; i++) {
+        port->serial_out(port, UART_TX, 0xFF);
+        tx_count++;
+    }
+
+    /* Let RX drain what arrived via loopback */
+    deadline = jiffies + msecs_to_jiffies(500);
+    while (time_before(jiffies, deadline) && rx_count < tx_count) {
+        lsr = port->serial_in(port, UART_LSR);
+        if (lsr & UART_LSR_DR) {
+            if (port->serial_in(port, UART_RX) == 0xFF)
+                rx_count++;
+        } else {
+            cpu_relax();
+        }
+    }
+
+    /* Restore port state */
+    port->serial_out(port, UART_FCR, old_fcr);
+    port->serial_out(port, UART_MCR, old_mcr);
+    port->serial_out(port, UART_LCR, UART_LCR_CONF_MODE_A);
+    port->serial_out(port, UART_DLL, old_dl & 0xff);
+    port->serial_out(port, UART_DLM, old_dl >> 8);
+    port->serial_out(port, UART_LCR, old_lcr);
+
+    if (rx_count <= 0)
+        return -EIO;
+
+    return rx_count;
+}
+
 /* uart_probe/rx_trig_test
  * Probe the serial devices RX FIFO trigger level
  * by setting internal loopback and sending data to itself,
@@ -464,7 +528,10 @@ static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
 	struct uart_state *state;
 	struct uart_8250_port *u8250p;
     unsigned long deadline;
-    int line, trig, rx_count = 0, rx_fifo_size = 0;
+    int line;
+	int measured_tx_fifo = 0;
+    int trig = 0;
+    int rx_count = 0;
 	unsigned char old_fcr, old_mcr, old_lcr, old_ier, lsr, iir;
 	u32 old_dl;
 
@@ -506,6 +573,11 @@ static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
 
 	mutex_lock(&tport->mutex);
 
+	measured_tx_fifo = measure_tx_fifo_size(tport, port, u8250p);
+
+    if (measured_tx_fifo < 1)
+        return -ENOTSUPP;
+
 	/* Store initial port config */
 	old_lcr = port->serial_in(port, UART_LCR);
     old_fcr = u8250p->fcr;
@@ -534,7 +606,7 @@ static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
 	port->serial_out(port, UART_IER, UART_IER_THRI);
 
 	/* Fill THR, but don't overfill it!  */
-	for (int i = 0; i <= 253; i++)
+	for (int i = 0; i <= measured_tx_fifo; i++)
 		port->serial_out(port, UART_TX, 0xFF);
 
 	/* Count how many bytes we rx until THR is empty */
@@ -548,7 +620,7 @@ static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
 
 		iir = port->serial_in(port, UART_IIR);
 		if (!(iir & UART_IIR_NO_INT) && (iir & 0x0E) == UART_IIR_THRI) {
-			trig = 254 - rx_count;
+			trig = measured_tx_fifo + 1 - rx_count;
 			break;
 		}
 
