@@ -22,7 +22,7 @@ usage() {
 }
 
 # Parse args
-OPTS=$(getopt -o hd:xr:t: --long help,device:,disable-fifo,rx-trigger:,tx-trigger: -n "$0" -- "$@")
+OPTS=$(getopt -o hd:xur:t: --long help,device:,disable-fifo,rtt,rx-trigger:,tx-trigger: -n "$0" -- "$@")
 eval set -- "$OPTS"
 
 while true; do
@@ -54,6 +54,39 @@ parse_csv_to_array() {
     fi
     outarr+=("$p")
   done
+}
+# Returns 0 (true) if /dev/ttyS<N> is actually initialized/probed by a driver.
+tty_is_initialized() {
+  local dev="$1" idx ok
+  [[ "$dev" =~ ^ttyS([0-9]+)$ ]] || { echo "DBG[$dev]: not ttyS<N>" >&2; return 1; }
+  idx="${BASH_REMATCH[1]}"
+
+  if sudo test -r /proc/tty/driver/serial 2>/dev/null; then
+    ok=$(sudo awk -v idx="$idx" '
+      $1 == idx ":" {
+        uart=""; port=""; irq=""; mmio=0
+        for (i=2; i<=NF; i++) {
+          if ($i ~ /^uart:/) { split($i,a,":"); uart=a[2] }
+          else if ($i ~ /^port:/) { split($i,a,":"); port=a[2] }
+          else if ($i ~ /^irq:/)  { split($i,a,":"); irq=a[2] }
+          else if ($i ~ /^mmio:/) { mmio=1 }
+        }
+        # Accept if: uart != unknown, irq > 0, and (port != 00000000 or mmio present)
+        if (uart != "unknown" && irq ~ /^[1-9][0-9]*$/ && (port != "00000000" || mmio==1))
+          print "ok";
+        else
+          printf "DBG[ttyS%s]: REJECT (uart=%s port=%s irq=%s mmio=%d)\n", idx, uart, port, irq, mmio > "/dev/stderr";
+      }
+    ' /proc/tty/driver/serial 2>/dev/null)
+
+    if [[ "$ok" == "ok" ]]; then
+      return 0
+    else
+      return 1
+    fi
+  else
+    return 1
+  fi
 }
 
 # Parse RX and TX trigger levels
@@ -106,8 +139,16 @@ fi
 
 for dev_path in "${cands[@]}"; do
   dev=$(basename "$dev_path")
+
+  # Skip if not actually initialized/probed
+  if ! tty_is_initialized "$dev"; then
+    # echo "  - $dev: skip (not initialized / no probed hardware)"
+    continue
+  fi
+
+  # Skip if busy
   if fuser -s "$dev_path"; then
-    echo "  - $dev: skip (busy)"
+    echo "  - $dev: skipped (busy)"
     continue
   fi
 
@@ -125,25 +166,14 @@ for dev_path in "${cands[@]}"; do
     else
       for rx in "${RX_LIST[@]}"; do
         echo "$rx" | sudo tee "$fifo_base/rx_trig_bytes" >/dev/null
-        # run only RX-relevant probes
         echo "  * $dev rx_trig_level set to $rx"
         if out=$(sudo cat "$DEBUGFS_BASE/rx_trig_level" 2>&1); then
           echo "     - rx_trig_level: $out"
         else
           echo "     - rx_trig_level (set=$rx): [error] $out"
         fi
-        if out=$(./rtt_test "$dev_path" 2>&1); then
-          rtt="$out"
-        else
-          rtt="[error] $out"
-        fi
-        echo "     - $rtt"
       done
-      if out=$(sudo cat "$DEBUGFS_BASE/rx_fifo_size" 2>&1); then
-        echo "     - rx_fifo_size: $out"
-      else
-        echo "     - rx_fifo_size: [error] $out"
-      fi
+    
     fi
   else
     # No RX list provided: run once with current setting
@@ -152,16 +182,13 @@ for dev_path in "${cands[@]}"; do
     else
       echo "     - rx_trig_level: [error] $out"
     fi
-    if out=$(sudo cat "$DEBUGFS_BASE/rx_fifo_size" 2>&1); then
+  fi
+
+  # --- RX FIFO size ---
+  if out=$(sudo cat "$DEBUGFS_BASE/rx_fifo_size" 2>&1); then
       echo "     - rx_fifo_size:  $out"
     else
       echo "     - rx_fifo_size:  [error] $out"
-    fi
-    if out=$(./rtt_test "$dev_path" 2>&1); then
-      rtt="$out"
-    else
-      rtt="[error] $out"
-    fi
   fi
 
   # --- TX trigger sweep (if provided) ---
@@ -171,32 +198,36 @@ for dev_path in "${cands[@]}"; do
     else
       for tx in "${TX_LIST[@]}"; do
         echo "$tx" | sudo tee "$fifo_base/tx_trig_bytes" >/dev/null
-        # run only TX-relevant probes
         if out=$(sudo cat "$DEBUGFS_BASE/tx_trig_level" 2>&1); then
           echo "     - tx_trig_level (set=$tx): $out"
         else
           echo "     - tx_trig_level (set=$tx): [error] $out"
         fi
-        rtt=$(./rtt_test "$dev_path" 2>&1)
-        echo "     - $rtt"
       done
-      if out=$(sudo cat "$DEBUGFS_BASE/tx_fifo_size" 2>&1); then
-        echo "     - tx_fifo_size: $out"
-      else
-        echo "     - tx_fifo_size: [error] $out"
-      fi
+
     fi
   else
     # No TX list provided: run once with current setting
     if out=$(sudo cat "$DEBUGFS_BASE/tx_trig_level" 2>&1); then
       echo "     - tx_trig_level: $out"
     else
-      echo "     - tx_trig_level: N/A"  # keep your earlier behavior if desired
+      echo "     - tx_trig_level: [error] $out"
     fi
-    if out=$(sudo cat "$DEBUGFS_BASE/tx_fifo_size" 2>&1); then
-      echo "     - tx_fifo_size:  $out"
+  fi
+
+  # --- TX FIFO size ---
+  if out=$(sudo cat "$DEBUGFS_BASE/tx_fifo_size" 2>&1); then
+        echo "     - tx_fifo_size: $out"
     else
-      echo "     - tx_fifo_size:  [error] $out"
+        echo "     - tx_fifo_size: [error] $out"
+  fi
+  
+  # --- RTT test (if requested) ---
+  if $TEST_RTT_ARG; then
+    if out=$(sudo ./rtt_test "$dev_path" 2>&1); then
+      echo "     - $out"
+    else
+      echo "     - RTT: [error] $out"
     fi
   fi
 done

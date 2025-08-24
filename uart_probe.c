@@ -96,7 +96,7 @@ static int measure_tx_fifo_size(struct tty_port *tport,
     port->serial_out(port, UART_DLM, 0);
     port->serial_out(port, UART_LCR, UART_LCR_WLEN8);
 
-    /* Fill TX path with a bounded count */
+    /* Fill TX FIFO */
     for (i = 0; i < FIFO_SIZE_MAX; i++) {
         port->serial_out(port, UART_TX, 0xFF);
         tx_count++;
@@ -214,11 +214,10 @@ static ssize_t rx_trig_probe_read(struct file *file, char __user *buf,
 	u8 acr = port->serial_in(port, UART_ACR);               /* bit5 = TLENB (950 table) */
 	port->serial_out(port, UART_LCR, save_lcr);
 
-	pr_info("%s: EFR=%02x (ECB=%d) ACR=%02x (TLENB=%d) type=%d caps=%lx\n",
+	pr_info("%s: EFR=%02x (ECB=%d) ACR=%02x (TLENB=%d) type=%d caps=%#x\n",
 			selected_dev, efr, !!(efr & UART_EFR_ECB),
 			acr, !!(acr & UART_ACR_TLENB),
-			port->type, up_to_u8250p(port)->capabilities);
-
+			port->type, (unsigned int)up_to_u8250p(port)->capabilities);
 	
 	pr_info("%s: ACR bits: b7=%d b6=%d b5=%d b4=%d b3=%d b2=%d b1=%d b0=%d\n",
 		selected_dev,
@@ -575,8 +574,15 @@ static ssize_t tx_trig_probe_read(struct file *file, char __user *buf,
 
 	measured_tx_fifo = measure_tx_fifo_size(tport, port, u8250p);
 
-    if (measured_tx_fifo < 1)
-        return -ENOTSUPP;
+	/* probe for fifosize, since port->fifosize may not be reliable */
+	measured_tx_fifo = measure_tx_fifo_size(tport, port, u8250p);
+	if (measured_tx_fifo < 1) {
+		char tmp[64];
+		int len;
+		mutex_unlock(&tport->mutex);
+		len = scnprintf(tmp, sizeof(tmp), "TX loopback failed or no data received\n");
+		return simple_read_from_buffer(buf, count, ppos, tmp, len);
+	}
 
 	/* Store initial port config */
 	old_lcr = port->serial_in(port, UART_LCR);
