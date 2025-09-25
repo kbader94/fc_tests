@@ -36,8 +36,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    cfsetospeed(&tty, B115200);
-    cfsetispeed(&tty, B115200);
+    cfsetospeed(&tty, B19200);
+    cfsetispeed(&tty, B19200);
 
     tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8; // 8-bit chars
     tty.c_iflag &= ~IGNBRK;                     // disable break processing
