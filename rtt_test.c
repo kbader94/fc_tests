@@ -61,6 +61,9 @@ int main(int argc, char *argv[]) {
     // flush any old data
     tcflush(fd, TCIOFLUSH);
 
+    struct timeval start, end;
+    gettimeofday(&start, NULL);
+
     // send test byte
     unsigned char tx = TEST_BYTE;
     ssize_t wlen = write(fd, &tx, 1);
@@ -70,8 +73,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    struct timeval start, end;
-    gettimeofday(&start, NULL);
 
     fd_set rfds;
     struct timeval timeout;
