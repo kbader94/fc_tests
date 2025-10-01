@@ -47,7 +47,7 @@ A Kernel module which provides debugfs interfaces for testing serial devices for
 ##### Arguments
 | Arg | Description | Required |
 |:---: |---         | --- |
-|-d, --device | Serial device to test  <br> Leave blank to test all devices <br>     eg: --device /dev/ttyS0 | Required |
+|-d, --device | Serial device to test  <br> Leave blank to test all devices <br>     eg: --device /dev/ttyS0 | Optional |
 | -r, --rx-trigger | Comma seperated list of FIFO Rx trigger levels to test. <br> If blank, only test the currently set trigger level <br> eg: --rx_trigger 1,4,8,14 | Optional |
 |-t, --tx-trigger | Comma seperated list of FIFO Tx trigger levels to test. <br> If blank, only test the currently set trigger level <br> eg: --rx_trigger 1,4,8,14 | Optional |
 
